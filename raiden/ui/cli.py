@@ -59,8 +59,7 @@ from raiden.utils.cli import (
     GasPriceChoiceType,
     MatrixServerType,
     PathRelativePath,
-    apply_config_file,
-    group,
+    group_parse_config,
     option,
     option_group,
 )
@@ -141,6 +140,7 @@ def options(func: Callable) -> Callable:
                 allow_dash=False,
             ),
             show_default=True,
+            aliases=["data_dir"],
         ),
         option(
             "--config-file",
@@ -527,15 +527,13 @@ def options(func: Callable) -> Callable:
     return func
 
 
-@group(invoke_without_command=True, context_settings={"max_content_width": 120})
+@group_parse_config(invoke_without_command=True, context_settings={"max_content_width": 120})
 @options
 @click.pass_context
 def run(ctx: Context, **kwargs: Any) -> None:
     # pylint: disable=too-many-locals,too-many-branches,too-many-statements
 
-    if kwargs["config_file"]:
-        apply_config_file(run, kwargs, ctx)
-
+    print(kwargs)
     configure_logging(
         kwargs["log_config"],
         log_json=kwargs["log_json"],

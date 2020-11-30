@@ -1,3 +1,4 @@
+import copy
 import errno
 import json
 import os
@@ -7,11 +8,11 @@ from itertools import groupby
 from json.decoder import JSONDecodeError
 from pathlib import Path
 from string import Template
-from typing import Any, Callable, Dict, List, MutableMapping, Union
+from typing import Any, Callable, Dict, List, MutableMapping
 
 import click
 import requests
-from click import Choice, MissingParameter
+from click import Choice
 from click._compat import term_len
 from click.formatting import iter_rows, measure_table, wrap_text
 from toml import TomlDecodeError, load
@@ -23,8 +24,8 @@ from raiden.network.rpc.middleware import faster_gas_price_strategy
 from raiden.utils.formatting import address_checksum_and_decode
 from raiden_contracts.constants import CHAINNAME_TO_ID
 
-CONTEXT_KEY_DEFAULT_OPTIONS = "raiden.options_using_default"
-LOG_CONFIG_OPTION_NAME = "log_config"
+LOG_CONFIG_CLI_NAME = "log-config"
+LOG_CONFIG_OPTION_NAME = LOG_CONFIG_CLI_NAME.replace("-", "_")
 
 
 class HelpFormatter(click.HelpFormatter):
@@ -78,8 +79,6 @@ class Context(click.Context):
 
 
 class CustomContextMixin:
-    """ Use above context class instead of the click default """
-
     def make_context(self, info_name, args, parent=None, **extra):
         """
         This function when given an info name and arguments will kick
@@ -99,38 +98,104 @@ class CustomContextMixin:
         for key, value in iter(self.context_settings.items()):  # type: ignore
             if key not in extra:
                 extra[key] = value
+
         ctx = Context(self, info_name=info_name, parent=parent, **extra)  # type: ignore
         with ctx.scope(cleanup=False):
             self.parse_args(ctx, args)  # type: ignore
         return ctx
 
 
-class UsesDefaultValueOptionMixin(click.Option):
-    def full_process_value(self, ctx, value):
+class ParseConfigFileMixin:
+    def _args_merge_config(self, ctx, args):
+        initial_args = copy.copy(args)
+        path_options = {
+            param.name for param in self.params if isinstance(param.type, (click.Path, click.File))  # type: ignore
+        }
+        # consume and parse args, fills ctx.params with parsed, internal representation
+        self.parse_args(ctx, args)  # type: ignore
+
+        file_path = ctx.params["config_file"]
+        config_file = Path(file_path)
+        config_file_values: MutableMapping[str, Any] = dict()
+        try:
+            with config_file.open() as config_file:
+                config_file_values = load(config_file)
+        except OSError as ex:
+            if "--config-file" in initial_args or ex.errno != errno.ENOENT:
+                raise ConfigurationError(f"Error opening config file: {ex}")
+        except TomlDecodeError as ex:
+            raise ConfigurationError(f"Error loading config file: {ex}")
+
+        config_parameters = dict()
+        log_config = dict()
+        for config_name, config_value in config_file_values.items():
+            # simply convert to CLI option
+            if config_name == LOG_CONFIG_CLI_NAME:
+                # Uppercase log level names
+                for k, v in config_value.items():
+                    log_config[k] = v.upper()
+            else:
+                if config_name in path_options:
+                    config_value = os.path.expanduser(config_value)
+                config_parameters[f"--{config_name}"] = config_value
+        # overload log config string
+        # therefore, we have to parse it first
+        cli_log_dict = ctx.params[LOG_CONFIG_OPTION_NAME]
+        if "--log-config" in initial_args:
+            # let the original values overwrite the config file values
+            log_config.update(cli_log_dict)
+        else:
+            cli_log_dict.update(log_config)
+            log_config = cli_log_dict
+        # HACK parse to string again
+        log_str = ""
+        for logger_name, logger_level in log_config.items():
+            log_str += f"{logger_name}:{logger_level.upper()},"
+
+        # delete the entries that are explicitly provided from the CLI
+        for val in initial_args:
+            if val in config_parameters:
+                assert val.startswith("--")
+                # remove overwrites
+                del config_parameters[val]
+        # since this is the merged dict already, always use this
+
+        log_config_option_name = f"--{LOG_CONFIG_CLI_NAME}"
+        # replace or append the merged log-config string
+        try:
+            i = initial_args.index(log_config_option_name)
+            initial_args[i + 1] = log_str
+        except ValueError:
+            # only append when explicit config file was given!
+            if "--config_file" in initial_args:
+                initial_args += [log_config_option_name, log_str]
+
+        # now append all config parameters that were not present in the cli
+        for k, v in config_parameters.items():
+            initial_args += [k, v]
+        # FIXME we blindly insert args from the config to the CLI args,
+        # which can be a problem when later on subcommands are handled!
+        return initial_args
+
+    def make_context(self, info_name, args, parent=None, **extra):
         """
-        Slightly modified copy of ``Option.full_process_value()`` that records which options use
-        default values in ``ctx.meta['raiden.options_using_default']``.
-
-        This is then used in ``apply_config_file()`` to establish precedence between values given
-        via the config file and the cli.
+        FIXME maybe this is not the best place to read and parse
+        the config file
         """
-        if value is None and self.prompt is not None and not ctx.resilient_parsing:  # type: ignore
-            return self.prompt_for_value(ctx)
+        for key, value in iter(self.context_settings.items()):  # type: ignore
+            if key not in extra:
+                extra[key] = value
 
-        value = self.process_value(ctx, value)
+        initial_ctx = Context(self, info_name=info_name, parent=parent, **extra)  # type: ignore
+        # TODO ML should we enforce the cleanup here?
+        with initial_ctx.scope(cleanup=True):
+            args_and_config_args = self._args_merge_config(initial_ctx, args)
 
-        if value is None:
-            value = self.get_default(ctx)
-            if not self.value_is_missing(value):
-                ctx.meta.setdefault(CONTEXT_KEY_DEFAULT_OPTIONS, set()).add(self.name)
-
-        if self.required and self.value_is_missing(value):
-            raise MissingParameter(ctx=ctx, param=self)
-
-        return value
+        # Now make the initial ctx with the modified args
+        return super().make_context(info_name, args_and_config_args, parent=parent, **extra)
 
 
-class GroupableOption(UsesDefaultValueOptionMixin, click.Option):
+class GroupableOption(click.Option):
     def __init__(
         self,
         param_decls=None,
@@ -200,12 +265,30 @@ class GroupableOptionCommandGroup(CustomContextMixin, click.Group):
         return super().group(*args, **{"cls": self.__class__, **kwargs})
 
 
+class ParseConfigGroupableOptionCommandGroup(
+    ParseConfigFileMixin, CustomContextMixin, click.Group
+):
+    def format_options(self, ctx, formatter):
+        GroupableOptionCommand.format_options(self, ctx, formatter)  # type: ignore
+        self.format_commands(ctx, formatter)
+
+    def command(self, *args, **kwargs):
+        return super().command(*args, **{"cls": GroupableOptionCommand, **kwargs})
+
+    def group(self, *args, **kwargs):
+        return super().group(*args, **{"cls": GroupableOptionCommandGroup, **kwargs})
+
+
 def command(name=None, cls=GroupableOptionCommand, **attrs):
     return click.command(name, cls, **attrs)
 
 
-def group(name=None, **attrs):
-    return click.group(name, **{"cls": GroupableOptionCommandGroup, **attrs})  # type: ignore
+def group(name=None, cls=GroupableOptionCommandGroup, **attrs):
+    return click.group(name, **{"cls": cls, **attrs})  # type: ignore
+
+
+def group_parse_config(name=None, **attrs):
+    return click.group(name, **{"cls": ParseConfigGroupableOptionCommandGroup, **attrs})  # type: ignore
 
 
 def option(*args, **kwargs):
@@ -253,6 +336,8 @@ class LogLevelConfigType(click.ParamType):
         if value.strip(" ") == "":
             return None  # default value
 
+        if value.endswith(","):
+            value = value[:-1]
         for logger_config in value.split(","):
             logger_name, logger_level = logger_config.split(":")
             level_config[logger_name] = logger_level.upper()
@@ -349,80 +434,6 @@ class PathRelativePath(click.Path):
     @staticmethod
     def expand_default(default, params):
         return HypenTemplate(default).substitute(params)
-
-
-def apply_config_file(
-    command_function: Union[click.Command, click.Group],
-    cli_params: Dict[str, Any],
-    ctx,
-    config_file_option_name="config_file",
-):
-    """ Applies all options set in the config file to `cli_params` """
-    options_using_default = ctx.meta.get(CONTEXT_KEY_DEFAULT_OPTIONS, set())
-    paramname_to_param = {param.name: param for param in command_function.params}
-    path_params = {
-        param.name
-        for param in command_function.params
-        if isinstance(param.type, (click.Path, click.File))
-    }
-
-    config_file_path = Path(cli_params[config_file_option_name])
-    config_file_values: MutableMapping[str, Any] = dict()
-    try:
-        with config_file_path.open() as config_file:
-            config_file_values = load(config_file)
-    except OSError as ex:
-        # Silently ignore if 'file not found' and the config file path is the default and
-        # the option wasn't explicitly supplied on the command line
-        config_file_param = paramname_to_param[config_file_option_name]
-        config_file_default_path = Path(
-            config_file_param.type.expand_default(  # type: ignore
-                config_file_param.get_default(ctx), cli_params
-            )
-        )
-        default_config_missing = (
-            ex.errno == errno.ENOENT
-            and config_file_path.resolve() == config_file_default_path.resolve()
-            and config_file_option_name in options_using_default
-        )
-        if default_config_missing:
-            cli_params["config_file"] = None
-        else:
-            raise ConfigurationError(f"Error opening config file: {ex}")
-
-    except TomlDecodeError as ex:
-        raise ConfigurationError(f"Error loading config file: {ex}")
-
-    for config_name, config_value in config_file_values.items():
-        config_name_int = config_name.replace("-", "_")
-
-        if config_name_int not in paramname_to_param:
-            click.secho(
-                f"Unknown setting '{config_name}' found in config file - ignoring.", fg="yellow"
-            )
-            continue
-
-        if config_name_int in path_params:
-            # Allow users to use `~` in paths in the config file
-            config_value = os.path.expanduser(config_value)
-
-        if config_name_int == LOG_CONFIG_OPTION_NAME:
-            # Uppercase log level names
-            config_value = {k: v.upper() for k, v in config_value.items()}
-        else:
-            # Pipe config file values through cli converter to ensure correct types
-            # We exclude `log-config` because it already is a dict when loading from toml
-            try:
-                config_value = paramname_to_param[config_name_int].type.convert(
-                    config_value, paramname_to_param[config_name_int], ctx
-                )
-            except click.BadParameter as ex:
-                raise ConfigurationError(f"Invalid config file setting '{config_name}': {ex}")
-
-        # Only use the config file value if the option wasn't explicitly given on the command line
-        option_has_default = paramname_to_param[config_name_int].default is not None
-        if not option_has_default or config_name_int in options_using_default:
-            cli_params[config_name_int] = config_value
 
 
 def get_matrix_servers(
